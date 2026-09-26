@@ -12,6 +12,7 @@ const icons = {
   adjustments: "🧮",
   history: "📜",
   warehouse: "🏭",
+  profile: "👤",
   logout: "🚪",
 };
 
@@ -332,6 +333,7 @@ function App() {
   const [products, setProducts] = useState([]);
   const [warehouses, setWarehouses] = useState([]);
   const [history, setHistory] = useState([]);
+  const [aiPredictions, setAiPredictions] = useState(null);
   const [toast, setToast] = useState("");
   const [editingProduct, setEditingProduct] = useState(null);
   const [activeModal, setActiveModal] = useState(null); // 'receipt' | 'delivery' | 'transfer' | 'adjustment'
@@ -354,12 +356,23 @@ function App() {
     }
   }
 
+  async function loadAI() {
+    try {
+      const data = await api("/ai/stockout-predictions");
+      setAiPredictions(data);
+    } catch (e) {
+      // non-fatal — AI panel shows error inline
+      setAiPredictions({ error: e.message });
+    }
+  }
+
   useEffect(() => {
     if (localStorage.getItem("stocksense_token")) {
       api("/auth/me")
         .then(d => {
           setUser(d);
           loadAll();
+          loadAI();
         })
         .catch(() => {
           localStorage.removeItem("stocksense_token");
@@ -380,10 +393,11 @@ function App() {
     setUser(null);
   }
 
-  if (!user) return <Auth onLogin={u => { setUser(u); loadAll(); }} />;
+  if (!user) return <Auth onLogin={u => { setUser(u); loadAll(); loadAI(); }} />;
 
   const refresh = async (msg = "Updated successfully ✓") => {
     await loadAll();
+    await loadAI();
     setToast(msg);
   };
 
@@ -414,9 +428,10 @@ function App() {
           <Nav icon={icons.history} label="Move History" active={page === "history"} onClick={() => setPage("history")} />
           <div className="nav-section">SYSTEM</div>
           <Nav icon={icons.warehouse} label="Warehouses" active={page === "warehouses"} onClick={() => setPage("warehouses")} />
+          <Nav icon={icons.profile} label="My Profile" active={page === "profile"} onClick={() => setPage("profile")} />
         </nav>
         <div className="sidebar-bottom">
-          <div>
+          <div style={{ cursor: "pointer" }} onClick={() => setPage("profile")}>
             👤 {user.name}
             <small>{user.role}</small>
           </div>
@@ -450,7 +465,8 @@ function App() {
               history={history}
               products={products}
               warehouses={warehouses}
-              onRefresh={refresh}
+              aiPredictions={aiPredictions}
+              onRefresh={async () => { await refresh("Dashboard refreshed ✓"); }}
               onUpdateStatus={updateStatus}
               globalSearch={globalSearch}
             />
@@ -543,7 +559,18 @@ function App() {
           {page === "warehouses" && (
             <Warehouses
               warehouses={warehouses}
-              onDone={() => refresh("Warehouse added successfully ✓")}
+              onDone={msg => refresh(msg || "Warehouse saved ✓")}
+            />
+          )}
+
+          {page === "profile" && (
+            <Profile
+              user={user}
+              onUpdated={updatedUser => {
+                setUser(updatedUser);
+                setToast("Profile updated ✓");
+              }}
+              onLogout={logout}
             />
           )}
         </div>
@@ -599,7 +626,7 @@ function PageTitle({ title, sub, action }) {
   );
 }
 
-function Dashboard({ dash, history, products, warehouses, onRefresh, onUpdateStatus, globalSearch }) {
+function Dashboard({ dash, history, products, warehouses, aiPredictions, onRefresh, onUpdateStatus, globalSearch }) {
   const [docFilter, setDocFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
   const [warehouseFilter, setWarehouseFilter] = useState("all");
@@ -777,6 +804,9 @@ function Dashboard({ dash, history, products, warehouses, onRefresh, onUpdateSta
           onUpdateStatus={onUpdateStatus}
         />
       </div>
+
+      {/* AI Inventory Insights Panel */}
+      <AIStockoutPanel aiPredictions={aiPredictions} />
     </>
   );
 }
@@ -1609,6 +1639,10 @@ function Warehouses({ warehouses, onDone }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState("");
 
   async function add(e) {
     e.preventDefault();
@@ -1618,11 +1652,38 @@ function Warehouses({ warehouses, onDone }) {
     try {
       await api("/warehouses", { method: "POST", body: JSON.stringify({ name: name.trim() }) });
       setName("");
-      await onDone();
+      await onDone("Warehouse added successfully ✓");
     } catch (err) {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  function startEdit(w) {
+    setEditingId(w.id);
+    setEditName(w.name);
+    setEditError("");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditName("");
+    setEditError("");
+  }
+
+  async function saveEdit(id) {
+    if (!editName.trim()) return;
+    setEditBusy(true);
+    setEditError("");
+    try {
+      await api(`/warehouses/${id}`, { method: "PUT", body: JSON.stringify({ name: editName.trim() }) });
+      setEditingId(null);
+      await onDone("Warehouse renamed successfully ✓");
+    } catch (err) {
+      setEditError(err.message);
+    } finally {
+      setEditBusy(false);
     }
   }
 
@@ -1645,13 +1706,266 @@ function Warehouses({ warehouses, onDone }) {
         <div className="warehouse-list">
           {warehouses.map(w => (
             <div key={w.id}>
-              <span>🏭 <b>{w.name}</b></span>
+              {editingId === w.id ? (
+                <div className="inline-edit" style={{ flex: 1 }}>
+                  <input
+                    value={editName}
+                    onChange={e => setEditName(e.target.value)}
+                    style={{ marginRight: 8 }}
+                    autoFocus
+                  />
+                  {editError && <small style={{ color: "#ef4444", display: "block" }}>{editError}</small>}
+                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                    <button className="primary btn-sm" disabled={editBusy} onClick={() => saveEdit(w.id)}>
+                      {editBusy ? "Saving…" : "✓ Save"}
+                    </button>
+                    <button className="btn-sm" onClick={cancelEdit}>✕ Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <span>🏭 <b>{w.name}</b></span>
+              )}
               <span><b>{w.stock_qty}</b> units stored</span>
+              {editingId !== w.id && (
+                <button className="btn-sm" onClick={() => startEdit(w)} style={{ marginLeft: "auto" }}>✏️ Rename</button>
+              )}
             </div>
           ))}
         </div>
       </div>
     </>
+  );
+}
+
+function Profile({ user, onUpdated, onLogout }) {
+  const [name, setName] = useState(user.name || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  async function save(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setBusy(true);
+    setError("");
+    setSuccess("");
+    try {
+      const updated = await api("/auth/profile", {
+        method: "PUT",
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      onUpdated(updated);
+      setSuccess("Profile saved successfully.");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <PageTitle title="My Profile" sub="View your account information and update your display name" />
+      <div className="panel" style={{ maxWidth: 480 }}>
+        <form onSubmit={save} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {error && <div className="notice notice-error">{error}</div>}
+          {success && <div className="notice notice-success">{success}</div>}
+
+          <label>
+            Display Name
+            <input
+              type="text"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              required
+              placeholder="Your display name"
+            />
+          </label>
+
+          <label>
+            Email Address
+            <input type="email" value={user.email} readOnly style={{ opacity: 0.6, cursor: "not-allowed" }} />
+          </label>
+
+          <label>
+            Role
+            <input type="text" value={user.role} readOnly style={{ opacity: 0.6, cursor: "not-allowed" }} />
+          </label>
+
+          <button type="submit" className="primary" disabled={busy}>
+            {busy ? "Saving…" : "💾 Save Changes"}
+          </button>
+        </form>
+
+        <hr style={{ margin: "24px 0", border: "none", borderTop: "1px solid #e2e8f0" }} />
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <b>Session</b>
+            <p style={{ margin: "4px 0 0", color: "#64748b", fontSize: "0.85rem" }}>You are currently signed in as <b>{user.email}</b></p>
+          </div>
+          <button
+            className="btn-danger"
+            onClick={() => {
+              localStorage.removeItem("stocksense_token");
+              onLogout();
+            }}
+          >
+            🚪 Sign Out
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+const RISK_COLORS = {
+  CRITICAL: { bg: "#fff0f0", border: "#fecaca", text: "#dc2626", badge: "#dc2626" },
+  HIGH: { bg: "#fff7ed", border: "#fed7aa", text: "#ea580c", badge: "#ea580c" },
+  MEDIUM: { bg: "#fefce8", border: "#fde68a", text: "#ca8a04", badge: "#ca8a04" },
+  LOW: { bg: "#f0fdf4", border: "#bbf7d0", text: "#16a34a", badge: "#16a34a" },
+  INSUFFICIENT_DATA: { bg: "#f8fafc", border: "#e2e8f0", text: "#64748b", badge: "#64748b" },
+};
+
+function AIStockoutPanel({ aiPredictions }) {
+  const [showAll, setShowAll] = useState(false);
+  const [riskFilter, setRiskFilter] = useState("all");
+
+  if (!aiPredictions) {
+    return (
+      <div className="panel">
+        <div className="panel-head"><h3>🤖 AI Inventory Insights</h3></div>
+        <div className="empty">Loading AI predictions…</div>
+      </div>
+    );
+  }
+
+  if (aiPredictions.error) {
+    return (
+      <div className="panel">
+        <div className="panel-head"><h3>🤖 AI Inventory Insights</h3></div>
+        <div className="notice notice-error">Could not load predictions: {aiPredictions.error}</div>
+      </div>
+    );
+  }
+
+  const { predictions = [], summary = {} } = aiPredictions;
+  const filtered = riskFilter === "all" ? predictions : predictions.filter(p => p.risk === riskFilter);
+  const displayed = showAll ? filtered : filtered.slice(0, 8);
+
+  const riskLabel = {
+    CRITICAL: "🔴 CRITICAL",
+    HIGH: "🟠 HIGH",
+    MEDIUM: "🟡 MEDIUM",
+    LOW: "🟢 LOW",
+    INSUFFICIENT_DATA: "⚪ NO DATA",
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>🤖 AI Inventory Insights — Stockout Predictions</h3>
+        <small style={{ color: "#64748b" }}>
+          Based on {summary.analysis_window_days}-day delivery history · {summary.at_risk_this_month} products at risk this month
+        </small>
+      </div>
+
+      {/* Summary KPI chips */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+        {[
+          ["CRITICAL", summary.critical_count, "🔴"],
+          ["HIGH", summary.high_count, "🟠"],
+          ["MEDIUM", summary.medium_count, "🟡"],
+        ].map(([risk, count, icon]) => (
+          <div
+            key={risk}
+            style={{
+              background: RISK_COLORS[risk].bg,
+              border: `1px solid ${RISK_COLORS[risk].border}`,
+              borderRadius: 8,
+              padding: "8px 14px",
+              cursor: "pointer",
+              fontWeight: 600,
+              color: RISK_COLORS[risk].text,
+              opacity: riskFilter !== "all" && riskFilter !== risk ? 0.45 : 1,
+            }}
+            onClick={() => setRiskFilter(riskFilter === risk ? "all" : risk)}
+          >
+            {icon} {count} {risk}
+          </div>
+        ))}
+        {riskFilter !== "all" && (
+          <button className="btn-sm" onClick={() => setRiskFilter("all")} style={{ alignSelf: "center" }}>✕ Show All</button>
+        )}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="empty">No products match the selected risk filter.</div>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Risk</th>
+                <th>Product</th>
+                <th>SKU</th>
+                <th>Category</th>
+                <th>Current Stock</th>
+                <th>Avg Daily Use</th>
+                <th>Days Left</th>
+                <th>Est. Stockout Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayed.map(p => {
+                const rc = RISK_COLORS[p.risk] || RISK_COLORS.INSUFFICIENT_DATA;
+                return (
+                  <tr key={p.product_id} style={{ background: rc.bg }}>
+                    <td>
+                      <span style={{
+                        background: rc.badge,
+                        color: "#fff",
+                        borderRadius: 4,
+                        padding: "2px 8px",
+                        fontSize: "0.78rem",
+                        fontWeight: 700,
+                        letterSpacing: "0.04em",
+                      }}>
+                        {riskLabel[p.risk] || p.risk}
+                      </span>
+                    </td>
+                    <td><b>{p.product_name}</b></td>
+                    <td><code>{p.sku}</code></td>
+                    <td>{p.category}</td>
+                    <td><b>{p.current_stock}</b> {p.unit}</td>
+                    <td>{p.avg_daily_usage > 0 ? `${p.avg_daily_usage} ${p.unit}/day` : "—"}</td>
+                    <td style={{ fontWeight: 700, color: rc.text }}>
+                      {p.days_until_stockout !== null ? `${p.days_until_stockout}d` : "—"}
+                    </td>
+                    <td style={{ color: rc.text }}>
+                      {p.estimated_stockout_date || "—"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {filtered.length > 8 && (
+        <div style={{ textAlign: "center", marginTop: 12 }}>
+          <button className="btn-sm" onClick={() => setShowAll(v => !v)}>
+            {showAll ? "▲ Show Less" : `▼ Show All ${filtered.length} Products`}
+          </button>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12, fontSize: "0.78rem", color: "#94a3b8" }}>
+        ℹ️ Predictions use average daily consumption from the last {summary.analysis_window_days} days of completed deliveries.
+        Products with no delivery history show "—" (Insufficient Data).
+      </div>
+    </div>
   );
 }
 
