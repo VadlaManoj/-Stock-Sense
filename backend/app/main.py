@@ -702,3 +702,209 @@ def get_dashboard(authorization: Optional[str] = Header(None),
         "max_warehouse_qty": max([r["qty"] for r in wh] or [1]),
         "recent_moves": [dict(r) for r in recent],
     }
+
+# --- Profile Routes ---
+class ProfileUpdate(BaseModel):
+    name: str = Field(..., min_length=1)
+
+@app.put("/api/auth/profile")
+def update_profile(x: ProfileUpdate, authorization: Optional[str] = Header(None)):
+    user = auth(authorization)
+    name = x.name.strip()
+    if not name:
+        raise HTTPException(400, "Name is required")
+    c = db()
+    c.execute("UPDATE users SET name=? WHERE id=?", (name, user["id"]))
+    c.commit()
+    updated = c.execute("SELECT id, name, email, role FROM users WHERE id=?", (user["id"],)).fetchone()
+    c.close()
+    return dict(updated)
+
+# --- Warehouse Edit Route ---
+@app.put("/api/warehouses/{id}")
+def update_warehouse(id: int, x: WarehouseIn, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    name = x.name.strip()
+    if not name:
+        raise HTTPException(400, "Warehouse name cannot be empty")
+    c = db()
+    wh = c.execute("SELECT id FROM warehouses WHERE id=?", (id,)).fetchone()
+    if not wh:
+        c.close()
+        raise HTTPException(404, "Warehouse not found")
+    dup = c.execute("SELECT id FROM warehouses WHERE name=? AND id!=?", (name, id)).fetchone()
+    if dup:
+        c.close()
+        raise HTTPException(400, "A warehouse with that name already exists")
+    c.execute("UPDATE warehouses SET name=? WHERE id=?", (name, id))
+    c.commit()
+    c.close()
+    return {"message": "Warehouse updated successfully"}
+
+# ==========================================
+# AI Stockout Prediction
+# ==========================================
+
+# Configurable risk thresholds (days until stockout)
+RISK_THRESHOLDS = {
+    "CRITICAL": 7,   # <= 7 days
+    "HIGH": 14,      # <= 14 days
+    "MEDIUM": 30,    # <= 30 days
+    # > 30 days => LOW
+}
+
+# Minimum number of completed deliveries required to make a prediction
+MIN_DATA_POINTS = 1
+# Analysis window in days
+ANALYSIS_WINDOW_DAYS = 30
+
+def _classify_risk(days_until_stockout: Optional[float], current_stock: float) -> str:
+    """Classify risk level from days until stockout."""
+    if current_stock <= 0:
+        return "CRITICAL"
+    if days_until_stockout is None:
+        return "INSUFFICIENT_DATA"
+    if days_until_stockout <= RISK_THRESHOLDS["CRITICAL"]:
+        return "CRITICAL"
+    if days_until_stockout <= RISK_THRESHOLDS["HIGH"]:
+        return "HIGH"
+    if days_until_stockout <= RISK_THRESHOLDS["MEDIUM"]:
+        return "MEDIUM"
+    return "LOW"
+
+def compute_stockout_predictions(c) -> list:
+    """
+    Compute stockout predictions for all products.
+
+    Algorithm:
+    1. For each product, get current total stock across all warehouses.
+    2. Look at completed (Done) delivery operations in the last ANALYSIS_WINDOW_DAYS days.
+    3. Calculate total_consumed = sum of delivered quantities.
+    4. average_daily_usage = total_consumed / ANALYSIS_WINDOW_DAYS
+    5. estimated_days = current_stock / average_daily_usage
+    6. Classify risk.
+    """
+    from datetime import date
+
+    window_start = (datetime.now(timezone.utc) - timedelta(days=ANALYSIS_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Get all products with their current total stock
+    products = c.execute("""
+        SELECT p.id, p.name, p.sku, p.category, p.unit, p.reorder_level,
+               COALESCE(SUM(s.qty), 0) current_stock
+        FROM products p
+        LEFT JOIN stock s ON s.product_id = p.id
+        GROUP BY p.id
+        ORDER BY p.name
+    """).fetchall()
+
+    # Get completed delivery quantities per product in the analysis window
+    # Only count completed (Done) deliveries
+    deliveries = c.execute("""
+        SELECT product_id, SUM(ABS(quantity)) total_consumed
+        FROM moves
+        WHERE type = 'delivery'
+          AND status = 'Done'
+          AND date >= ?
+        GROUP BY product_id
+    """, (window_start,)).fetchall()
+
+    consumption_map = {row["product_id"]: row["total_consumed"] for row in deliveries}
+
+    # Count data points (number of completed delivery operations per product)
+    data_points = c.execute("""
+        SELECT product_id, COUNT(*) cnt
+        FROM moves
+        WHERE type = 'delivery'
+          AND status = 'Done'
+          AND date >= ?
+        GROUP BY product_id
+    """, (window_start,)).fetchall()
+    data_points_map = {row["product_id"]: row["cnt"] for row in data_points}
+
+    results = []
+    for p in products:
+        pid = p["id"]
+        current_stock = p["current_stock"]
+        consumed = consumption_map.get(pid, 0.0)
+        dp_count = data_points_map.get(pid, 0)
+
+        avg_daily_usage = round(consumed / ANALYSIS_WINDOW_DAYS, 4) if consumed > 0 else 0.0
+
+        # Edge cases
+        if current_stock <= 0:
+            days_until_stockout = 0.0
+            stockout_date = today
+            status = "out_of_stock"
+        elif dp_count < MIN_DATA_POINTS or consumed == 0:
+            days_until_stockout = None
+            stockout_date = None
+            status = "insufficient_data"
+        elif avg_daily_usage <= 0:
+            days_until_stockout = None
+            stockout_date = None
+            status = "no_usage"
+        else:
+            days_until_stockout = round(current_stock / avg_daily_usage, 1)
+            predicted_date = datetime.now(timezone.utc) + timedelta(days=days_until_stockout)
+            stockout_date = predicted_date.strftime("%Y-%m-%d")
+            status = "predicted"
+
+        risk = _classify_risk(days_until_stockout, current_stock)
+
+        results.append({
+            "product_id": pid,
+            "product_name": p["name"],
+            "sku": p["sku"],
+            "category": p["category"],
+            "unit": p["unit"],
+            "reorder_level": p["reorder_level"],
+            "current_stock": current_stock,
+            "consumed_last_30d": round(consumed, 2),
+            "avg_daily_usage": avg_daily_usage,
+            "data_points": dp_count,
+            "analysis_window_days": ANALYSIS_WINDOW_DAYS,
+            "days_until_stockout": days_until_stockout,
+            "estimated_stockout_date": stockout_date,
+            "risk": risk,
+            "status": status,
+        })
+
+    # Sort: CRITICAL first, then HIGH, MEDIUM, LOW, INSUFFICIENT_DATA
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INSUFFICIENT_DATA": 4}
+    results.sort(key=lambda x: (risk_order.get(x["risk"], 5), x["product_name"]))
+    return results
+
+@app.get("/api/ai/stockout-predictions")
+def get_stockout_predictions(authorization: Optional[str] = Header(None)):
+    """
+    AI-powered stockout prediction using real historical delivery data.
+    Calculates average daily usage from completed deliveries in the last 30 days
+    and estimates how many days until each product runs out.
+    """
+    auth(authorization)
+    c = db()
+    try:
+        predictions = compute_stockout_predictions(c)
+    finally:
+        c.close()
+
+    # Summary stats
+    critical = [p for p in predictions if p["risk"] == "CRITICAL"]
+    high = [p for p in predictions if p["risk"] == "HIGH"]
+    medium = [p for p in predictions if p["risk"] == "MEDIUM"]
+    at_risk_this_month = [p for p in predictions if p["risk"] in ("CRITICAL", "HIGH", "MEDIUM")]
+
+    return {
+        "predictions": predictions,
+        "summary": {
+            "total_products": len(predictions),
+            "critical_count": len(critical),
+            "high_count": len(high),
+            "medium_count": len(medium),
+            "at_risk_this_month": len(at_risk_this_month),
+            "analysis_window_days": ANALYSIS_WINDOW_DAYS,
+            "generated_at": utc_now_iso(),
+        }
+    }
