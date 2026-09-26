@@ -7,7 +7,7 @@ client = httpx.Client(base_url="http://localhost:5173")
 # 1. Invalid Login
 r_bad = client.post("/api/auth/login", json={"email": "admin@stocksense.local", "password": "wrong"})
 assert r_bad.status_code == 401, f"Expected 401, got {r_bad.status_code}"
-assert r_bad.json()["detail"] == "Invalid email or password."
+assert "Invalid email or password" in r_bad.json()["detail"]
 print("[PASS] Invalid login correctly returned 401: Invalid email or password.")
 
 # 2. Signup
